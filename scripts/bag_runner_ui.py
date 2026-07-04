@@ -56,6 +56,12 @@ BATCH_EXPORT_ROOT = PACKAGE_ROOT / "temp" / "batch_exports"
 FIXED_CONFIG_NAME = "root_config.yaml"
 DEFAULT_RATE = 3.0
 WAIT_TIMEOUT_MS = 20000
+PLAY_START_MIN_DELAY_MS = 1500
+PLAY_SUBSCRIPTION_WAIT_TIMEOUT_MS = 12000
+PLAY_AUTO_UNPAUSE_DELAY_MS = 1500
+BAG_PLAY_QUEUE_SIZE = 2000
+BAG_PLAY_ADVERTISE_DELAY_SEC = 1.0
+IGNORED_BAG_PLAY_TOPICS = {"/clock", "/rosout", "/tf", "/tf_static"}
 OTHER_LIO_PROFILES = (
     {
         "key": "fastlio",
@@ -371,6 +377,7 @@ class AppSettings:
     root_config: str = FIXED_CONFIG_NAME
     build_before_run: bool = True
     enable_rviz: bool = True
+    analysis_sort_mode: str = "yaml"
 
 
 @dataclass
@@ -380,6 +387,14 @@ class BatchTestGroup:
     bag_ids: List[str] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass
+class BatchRunItem:
+    run_id: str
+    bag_id: str
+    repeat_index: int = 1
+    repeat_total: int = 1
 
 
 @dataclass
@@ -633,6 +648,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.setWindowTitle("Settings")
         self.setModal(True)
         self.resize(620, 320)
+        self.analysis_sort_mode = settings.analysis_sort_mode
 
         layout = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
@@ -671,6 +687,7 @@ class SettingsDialog(QtWidgets.QDialog):
             root_config=self.root_config_edit.text().strip() or FIXED_CONFIG_NAME,
             build_before_run=self.build_checkbox.isChecked(),
             enable_rviz=self.rviz_checkbox.isChecked(),
+            analysis_sort_mode=self.analysis_sort_mode,
         )
 
 
@@ -729,6 +746,10 @@ class BatchSelectionDialog(QtWidgets.QDialog):
         actions = QtWidgets.QHBoxLayout()
         select_all_btn = QtWidgets.QPushButton("Select All")
         clear_btn = QtWidgets.QPushButton("Clear")
+        self.repeat_spin = QtWidgets.QSpinBox()
+        self.repeat_spin.setRange(1, 100)
+        self.repeat_spin.setValue(1)
+        self.repeat_spin.setToolTip("Run each selected bag this many times.")
         self.mark_filter_combo = QtWidgets.QComboBox()
         self.mark_filter_combo.addItem("All Marks", "all")
         self.mark_filter_combo.addItem(self.marker_icons["warn"], "Warning", "warn")
@@ -742,6 +763,9 @@ class BatchSelectionDialog(QtWidgets.QDialog):
         actions.addSpacing(12)
         actions.addWidget(QtWidgets.QLabel("Mark"))
         actions.addWidget(self.mark_filter_combo)
+        actions.addSpacing(12)
+        actions.addWidget(QtWidgets.QLabel("Repeat Each"))
+        actions.addWidget(self.repeat_spin)
         actions.addStretch(1)
         actions.addWidget(self.selection_summary_label)
         layout.addLayout(actions)
@@ -765,6 +789,7 @@ class BatchSelectionDialog(QtWidgets.QDialog):
         select_all_btn.clicked.connect(lambda: self._set_all_children(QtCore.Qt.Checked))
         clear_btn.clicked.connect(lambda: self._set_all_children(QtCore.Qt.Unchecked))
         self.mark_filter_combo.currentIndexChanged.connect(self._refresh_tree)
+        self.repeat_spin.valueChanged.connect(self._update_selection_summary)
         self.batch_group_combo.currentIndexChanged.connect(self._update_group_buttons)
         self.load_group_btn.clicked.connect(self._load_selected_batch_group)
         self.save_group_btn.clicked.connect(self._save_current_selection_as_group)
@@ -821,7 +846,11 @@ class BatchSelectionDialog(QtWidgets.QDialog):
 
     def _update_selection_summary(self) -> None:
         selected_count = len(self.selected_ids)
-        self.selection_summary_label.setText(f"{selected_count} selected")
+        repeat_count = self.repeat_count()
+        run_count = selected_count * repeat_count
+        self.selection_summary_label.setText(
+            f"{selected_count} selected, {run_count} run{'s' if run_count != 1 else ''}"
+        )
 
     def _update_group_buttons(self) -> None:
         has_selection = bool(self.selected_ids)
@@ -1029,13 +1058,38 @@ class BatchSelectionDialog(QtWidgets.QDialog):
     def selected_bag_ids(self) -> List[str]:
         return [entry.bag_id for entry in self.entries if entry.bag_id in self.selected_ids]
 
+    def repeat_count(self) -> int:
+        return max(1, int(self.repeat_spin.value()))
+
+    def selected_run_items(self) -> List[BatchRunItem]:
+        run_items: List[BatchRunItem] = []
+        repeat_total = self.repeat_count()
+        order = 1
+        for bag_id in self.selected_bag_ids():
+            for repeat_index in range(1, repeat_total + 1):
+                run_items.append(
+                    BatchRunItem(
+                        run_id=f"run_{order:04d}",
+                        bag_id=bag_id,
+                        repeat_index=repeat_index,
+                        repeat_total=repeat_total,
+                    )
+                )
+                order += 1
+        return run_items
+
     def selected_batch_name(self) -> str:
         selected_ids = set(self.selected_bag_ids())
+        base_name = "Manual Selection"
         if selected_ids:
             for group in self.batch_groups:
                 if selected_ids == set(self._active_group_bag_ids(group)):
-                    return group.name
-        return "Manual Selection"
+                    base_name = group.name
+                    break
+        repeat_count = self.repeat_count()
+        if repeat_count > 1 and selected_ids:
+            return f"{base_name} x{repeat_count}"
+        return base_name
 
     def batch_test_groups_result(self) -> List[BatchTestGroup]:
         return [
@@ -1225,6 +1279,11 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self.total_paused_wall = 0.0
         self.current_bag_start_time = 0.0
         self.current_bag_end_time = 0.0
+        self.current_bag_topics: List[str] = []
+        self.current_play_topics: List[str] = []
+        self.play_wait_elapsed_ms = 0
+        self.play_start_not_before_wall = 0.0
+        self.awaiting_auto_unpause = False
         self.flag_event_times: List[float] = []
         self.current_pause_service = ""
         self.current_analysis_index = -1
@@ -1242,15 +1301,16 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self.visible_entry_indices: List[int] = []
         self.batch_mode_active = False
         self.batch_cancelled = False
-        self.batch_queue_ids: List[str] = []
-        self.batch_run_ids: List[str] = []
+        self.batch_queue_items: List[BatchRunItem] = []
+        self.batch_run_items: List[BatchRunItem] = []
+        self.current_batch_run_item: Optional[BatchRunItem] = None
         self.batch_total_count = 0
         self.batch_completed_count = 0
         self.batch_results: List[str] = []
-        self.batch_result_by_bag_id: Dict[str, str] = {}
+        self.batch_result_by_run_id: Dict[str, str] = {}
         self.batch_group_name = ""
         self.batch_started_at = ""
-        self.batch_new_record_keys: List[Tuple[str, str]] = []
+        self.batch_new_record_keys: List[Tuple[str, str, str]] = []
         self.yaml_favorites: List[str] = []
         self.yaml_favorite_aliases: Dict[str, str] = {}
         self._entry_selection_guard = False
@@ -1279,6 +1339,8 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self._connect_processes()
         self._load_state()
         self.fixed_yaml_badge.setText(f"Root YAML: {self.settings.root_config}")
+        analysis_sort_index = self.analysis_view_combo.findData(self.settings.analysis_sort_mode)
+        self.analysis_view_combo.setCurrentIndex(analysis_sort_index if analysis_sort_index >= 0 else 0)
         self._refresh_table()
         self._refresh_analysis_table()
         self._update_buttons()
@@ -1389,8 +1451,14 @@ class BagRunnerWindow(QtWidgets.QWidget):
         analysis_header = QtWidgets.QHBoxLayout()
         analysis_title = QtWidgets.QLabel("Analysis DB")
         analysis_title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        self.analysis_view_combo = QtWidgets.QComboBox()
+        self.analysis_view_combo.addItem("YAML Groups", "yaml")
+        self.analysis_view_combo.addItem("Newest First", "time_desc")
+        self.analysis_view_combo.addItem("Oldest First", "time_asc")
         self.export_analysis_btn = QtWidgets.QPushButton("Export Artifacts")
         analysis_header.addWidget(analysis_title, 1)
+        analysis_header.addWidget(QtWidgets.QLabel("View"))
+        analysis_header.addWidget(self.analysis_view_combo)
         analysis_header.addWidget(self.export_analysis_btn)
         analysis_layout.addLayout(analysis_header)
 
@@ -1553,6 +1621,7 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self.flag_btn.clicked.connect(self._publish_elevator_flag)
         self.stop_btn.clicked.connect(self._stop_session)
         self.settings_btn.clicked.connect(self._open_settings)
+        self.analysis_view_combo.currentIndexChanged.connect(self._handle_analysis_view_changed)
         self.export_analysis_btn.clicked.connect(self._export_selected_analysis_artifacts)
 
         self.pause_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Space), self)
@@ -1682,6 +1751,15 @@ class BagRunnerWindow(QtWidgets.QWidget):
             return ""
         return match.group(1)
 
+    def _current_ready_node_pattern(self) -> str:
+        if self.current_external_lio_profile is not None:
+            return self.current_external_lio_profile.ready_node_pattern
+        return r"^/(lio|lio_node)$"
+
+    @staticmethod
+    def _quote_shell_args(args: List[str]) -> str:
+        return " ".join(shlex.quote(str(arg)) for arg in args)
+
     def _handle_space_shortcut(self) -> None:
         focus = QtWidgets.QApplication.focusWidget()
         if isinstance(focus, (QtWidgets.QLineEdit, QtWidgets.QPlainTextEdit, QtWidgets.QAbstractSpinBox)):
@@ -1767,8 +1845,8 @@ class BagRunnerWindow(QtWidgets.QWidget):
     def _remaining_batch_wall_seconds(self) -> float:
         remaining = 0.0
         remaining += self._entry_remaining_wall_seconds(self.pending_entry, current_progress_only=True)
-        for bag_id in self.batch_queue_ids:
-            entry = self._find_entry_by_bag_id(bag_id)
+        for run_item in self.batch_queue_items:
+            entry = self._find_entry_by_bag_id(run_item.bag_id)
             remaining += self._entry_remaining_wall_seconds(entry)
         return remaining
 
@@ -1778,8 +1856,8 @@ class BagRunnerWindow(QtWidgets.QWidget):
         remaining = 0.0
         if include_current_pending:
             remaining += self._entry_remaining_wall_seconds(self.pending_entry)
-        for bag_id in self.batch_queue_ids:
-            entry = self._find_entry_by_bag_id(bag_id)
+        for run_item in self.batch_queue_items:
+            entry = self._find_entry_by_bag_id(run_item.bag_id)
             remaining += self._entry_remaining_wall_seconds(entry)
         if remaining <= 0.0:
             return ""
@@ -2742,18 +2820,82 @@ class BagRunnerWindow(QtWidgets.QWidget):
         selected_bag_id = ""
         if 0 <= selected_row < len(self.entries):
             selected_bag_id = self.entries[selected_row].bag_id
+        sort_mode = str(self.analysis_view_combo.currentData() or self.settings.analysis_sort_mode or "yaml")
         self.visible_analysis_indices = [
             idx for idx, record in enumerate(self.analysis_records) if record.bag_id == selected_bag_id
         ] if selected_bag_id else []
+        self.analysis_table.clear()
+        self.analysis_table.setHeaderLabels(
+            ["Finished", "Count", "Total Z", "Total", "End Err", "End Z Err", "X", "Y", "Z", "Img"]
+        )
+
+        def record_bag_label(record: AnalysisRecord) -> str:
+            entry = self._find_entry_by_bag_id(record.bag_id)
+            if entry is not None:
+                return entry.alias
+            if record.bag_path:
+                return Path(record.bag_path).stem
+            return record.bag_id or "(unknown bag)"
+
+        def add_record_child(
+            parent: QtWidgets.QTreeWidgetItem,
+            record_index: int,
+            include_bag_label: bool = False,
+        ) -> None:
+            record = self.analysis_records[record_index]
+            pose = record.terminal_pose if len(record.terminal_pose) >= 3 else [0.0, 0.0, 0.0]
+            finished_text = record.finished_at
+            if include_bag_label:
+                finished_text = f"{record.finished_at} | {record_bag_label(record)}"
+            child = QtWidgets.QTreeWidgetItem([
+                finished_text,
+                str(record.exit_commit_count),
+                f"{record.delta_z_total:.6f}",
+                f"{record.total_path_length:.6f}",
+                f"{record.terminal_error:.6f}",
+                f"{record.terminal_z_error:.6f}",
+                f"{pose[0]:.6f}",
+                f"{pose[1]:.6f}",
+                f"{pose[2]:.6f}",
+                "✓" if record.attachments else "✕",
+            ])
+            child.setData(0, QtCore.Qt.UserRole, record_index)
+            child.setToolTip(
+                0,
+                f"Bag: {record_bag_label(record)}\nPath: {record.bag_path}\nYAML: {self._yaml_group_display_text(record)}",
+            )
+            if record.comment:
+                child.setToolTip(1, record.comment)
+            for col in range(10):
+                child.setTextAlignment(col, QtCore.Qt.AlignCenter)
+            parent.addChild(child)
+
+        if sort_mode in {"time_desc", "time_asc"}:
+            reverse = sort_mode == "time_desc"
+            self.visible_analysis_indices.sort(
+                key=lambda idx: self.analysis_records[idx].finished_at or "",
+                reverse=reverse,
+            )
+            title = "Newest First" if reverse else "Oldest First"
+            parent = QtWidgets.QTreeWidgetItem([f"{title} ({len(self.visible_analysis_indices)} records)"])
+            parent.setFirstColumnSpanned(True)
+            parent.setFlags(parent.flags() & ~QtCore.Qt.ItemIsSelectable)
+            parent.setIcon(0, self._group_indicator_icon(True))
+            font = parent.font(0)
+            font.setBold(True)
+            parent.setFont(0, font)
+            self.analysis_table.addTopLevelItem(parent)
+            self.analysis_table.setFirstItemColumnSpanned(parent, True)
+            for record_index in self.visible_analysis_indices:
+                add_record_child(parent, record_index)
+            parent.setExpanded(True)
+            return
+
         self.visible_analysis_indices.sort(
             key=lambda idx: (
                 self._yaml_group_rank(self.analysis_records[idx].yaml_group_name),
                 self.analysis_records[idx].finished_at,
             )
-        )
-        self.analysis_table.clear()
-        self.analysis_table.setHeaderLabels(
-            ["Finished", "Count", "Total Z", "Total", "End Err", "End Z Err", "X", "Y", "Z", "Img"]
         )
         group_records = {}
         all_diff_keys = []
@@ -2794,24 +2936,7 @@ class BagRunnerWindow(QtWidgets.QWidget):
             self.analysis_table.setFirstItemColumnSpanned(parent, True)
 
             for record_index in record_indices:
-                record = self.analysis_records[record_index]
-                pose = record.terminal_pose if len(record.terminal_pose) >= 3 else [0.0, 0.0, 0.0]
-                child = QtWidgets.QTreeWidgetItem([
-                    record.finished_at,
-                    str(record.exit_commit_count),
-                    f"{record.delta_z_total:.6f}",
-                    f"{record.total_path_length:.6f}",
-                    f"{record.terminal_error:.6f}",
-                    f"{record.terminal_z_error:.6f}",
-                    f"{pose[0]:.6f}",
-                    f"{pose[1]:.6f}",
-                    f"{pose[2]:.6f}",
-                    "✓" if record.attachments else "✕",
-                ])
-                child.setData(0, QtCore.Qt.UserRole, record_index)
-                for col in range(10):
-                    child.setTextAlignment(col, QtCore.Qt.AlignCenter)
-                parent.addChild(child)
+                add_record_child(parent, record_index)
 
         for idx in range(self.analysis_table.topLevelItemCount()):
             self.analysis_table.topLevelItem(idx).setExpanded(True)
@@ -3277,15 +3402,20 @@ class BagRunnerWindow(QtWidgets.QWidget):
         entry: Optional[BagEntry],
         result_text: str,
         fallback_label: str = "",
+        run_item: Optional[BatchRunItem] = None,
     ) -> None:
+        active_run = run_item or self.current_batch_run_item
         label = entry.alias if entry is not None else (fallback_label or "unknown")
-        self.batch_results.append(f"{label}: {result_text}")
-        if entry is not None:
-            if entry.bag_id not in self.batch_result_by_bag_id:
-                self.batch_completed_count += 1
-            self.batch_result_by_bag_id[entry.bag_id] = result_text
+        if active_run is not None and active_run.repeat_total > 1:
+            label = f"{label} [{active_run.repeat_index}/{active_run.repeat_total}]"
+        if active_run is not None:
+            if active_run.run_id in self.batch_result_by_run_id:
+                return
+            self.batch_result_by_run_id[active_run.run_id] = result_text
+            self.batch_completed_count += 1
         else:
             self.batch_completed_count += 1
+        self.batch_results.append(f"{label}: {result_text}")
 
     def _open_batch_test_dialog(self) -> None:
         if self.session_running:
@@ -3300,47 +3430,60 @@ class BagRunnerWindow(QtWidgets.QWidget):
             return
         self.batch_test_groups = dialog.batch_test_groups_result()
         self._save_state()
-        bag_ids = dialog.selected_bag_ids()
-        if not bag_ids:
+        run_items = dialog.selected_run_items()
+        if not run_items:
             QtWidgets.QMessageBox.information(self, "No Selection", "Select at least one bag entry.")
             return
         self.batch_mode_active = True
         self.batch_cancelled = False
-        self.batch_queue_ids = list(bag_ids)
-        self.batch_run_ids = list(bag_ids)
-        self.batch_total_count = len(bag_ids)
+        self.batch_queue_items = list(run_items)
+        self.batch_run_items = list(run_items)
+        self.current_batch_run_item = None
+        self.batch_total_count = len(run_items)
         self.batch_completed_count = 0
         self.batch_results = []
-        self.batch_result_by_bag_id = {}
+        self.batch_result_by_run_id = {}
         self.batch_group_name = dialog.selected_batch_name()
         self.batch_started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.batch_new_record_keys = []
         self.lio_log_edit.clear()
         self.rosbag_log_edit.clear()
         self._append_lio_log(
-            f"[batch] starting batch test '{self.batch_group_name}' with {self.batch_total_count} entries"
+            f"[batch] starting batch test '{self.batch_group_name}' with {self.batch_total_count} runs"
         )
         self._start_next_batch_entry()
 
     def _start_next_batch_entry(self) -> None:
         if not self.batch_mode_active or self.session_running:
             return
-        while self.batch_queue_ids:
-            bag_id = self.batch_queue_ids.pop(0)
-            entry = self._find_entry_by_bag_id(bag_id)
+        while self.batch_queue_items:
+            run_item = self.batch_queue_items.pop(0)
+            self.current_batch_run_item = run_item
+            entry = self._find_entry_by_bag_id(run_item.bag_id)
             if entry is None:
-                self._complete_batch_entry(None, "missing entry", bag_id)
+                self._complete_batch_entry(None, "missing entry", run_item.bag_id, run_item)
+                self.current_batch_run_item = None
                 continue
             self.pending_entry = entry
+            repeat_suffix = (
+                f" [{run_item.repeat_index}/{run_item.repeat_total}]"
+                if run_item.repeat_total > 1
+                else ""
+            )
             self._set_status(
-                f"Batch {self.batch_completed_count + 1}/{self.batch_total_count}: {entry.alias}"
+                f"Batch {self.batch_completed_count + 1}/{self.batch_total_count}: {entry.alias}{repeat_suffix}"
                 f"{self._batch_eta_suffix(include_current_pending=True)}"
             )
             self._append_lio_log(
-                f"[batch] ({self.batch_completed_count + 1}/{self.batch_total_count}) starting {entry.alias}"
+                f"[batch] ({self.batch_completed_count + 1}/{self.batch_total_count}) "
+                f"starting {entry.alias}{repeat_suffix}"
             )
             self._start_entry_session(entry)
-            return
+            if self.session_running:
+                return
+            self._complete_batch_entry(entry, "start validation failed", run_item=run_item)
+            self.current_batch_run_item = None
+            continue
         self._finish_batch_mode()
 
     def _finish_batch_mode(self) -> None:
@@ -3357,11 +3500,12 @@ class BagRunnerWindow(QtWidgets.QWidget):
             self._append_lio_log(f"[warn] batch export failed: {exc}")
         self.batch_mode_active = False
         self.batch_cancelled = False
-        self.batch_queue_ids = []
-        self.batch_run_ids = []
+        self.batch_queue_items = []
+        self.batch_run_items = []
+        self.current_batch_run_item = None
         self.batch_total_count = 0
         self.batch_completed_count = 0
-        self.batch_result_by_bag_id = {}
+        self.batch_result_by_run_id = {}
         self.batch_group_name = ""
         self.batch_started_at = ""
         self.batch_new_record_keys = []
@@ -3379,6 +3523,15 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self.fixed_yaml_badge.setText(f"Root YAML: {self.settings.root_config}")
         self._save_state()
         self._append_lio_log("[info] settings updated")
+
+    def _handle_analysis_view_changed(self) -> None:
+        sort_mode = str(self.analysis_view_combo.currentData() or "yaml")
+        if sort_mode not in {"yaml", "time_desc", "time_asc"}:
+            sort_mode = "yaml"
+        if self.settings.analysis_sort_mode != sort_mode:
+            self.settings.analysis_sort_mode = sort_mode
+            self._save_state()
+        self._refresh_analysis_table()
 
     def _load_selected_analysis_detail(self) -> None:
         self._update_buttons()
@@ -3606,18 +3759,18 @@ class BagRunnerWindow(QtWidgets.QWidget):
         )
         return copied
 
-    def _batch_analysis_records(self) -> List[AnalysisRecord]:
-        records: List[AnalysisRecord] = []
+    def _batch_analysis_records_by_run_id(self) -> Dict[str, List[AnalysisRecord]]:
+        records_by_run_id: Dict[str, List[AnalysisRecord]] = {}
         used_indices: set[int] = set()
-        for bag_id, finished_at in self.batch_new_record_keys:
+        for run_id, bag_id, finished_at in self.batch_new_record_keys:
             for idx, record in enumerate(self.analysis_records):
                 if idx in used_indices:
                     continue
                 if record.bag_id == bag_id and record.finished_at == finished_at:
-                    records.append(record)
+                    records_by_run_id.setdefault(run_id, []).append(record)
                     used_indices.add(idx)
                     break
-        return records
+        return records_by_run_id
 
     def _export_batch_analysis_artifacts(self, summary_title: str, summary_lines: List[str]) -> Path:
         now = datetime.now()
@@ -3628,39 +3781,45 @@ class BagRunnerWindow(QtWidgets.QWidget):
         export_dir = self._unique_child_path(BATCH_EXPORT_ROOT, f"batch_{finished_tag}_{batch_component}")
         export_dir.mkdir(parents=True, exist_ok=True)
 
-        records_by_bag_id: Dict[str, List[AnalysisRecord]] = {}
-        for record in self._batch_analysis_records():
-            records_by_bag_id.setdefault(record.bag_id, []).append(record)
-        for records in records_by_bag_id.values():
+        records_by_run_id = self._batch_analysis_records_by_run_id()
+        for records in records_by_run_id.values():
             records.sort(key=lambda item: item.finished_at or "")
 
         rows = []
-        for order, bag_id in enumerate(self.batch_run_ids, start=1):
-            entry = self._find_entry_by_bag_id(bag_id)
-            alias = entry.alias if entry is not None else bag_id
-            entry_dir_name = f"{order:02d}_{self._sanitize_filename_component(alias)}"
+        for order, run_item in enumerate(self.batch_run_items, start=1):
+            entry = self._find_entry_by_bag_id(run_item.bag_id)
+            alias = entry.alias if entry is not None else run_item.bag_id
+            repeat_suffix = (
+                f"_run{run_item.repeat_index:02d}of{run_item.repeat_total:02d}"
+                if run_item.repeat_total > 1
+                else ""
+            )
+            entry_dir_name = f"{order:02d}_{self._sanitize_filename_component(alias)}{repeat_suffix}"
             entry_dir = export_dir / entry_dir_name
             entry_dir.mkdir(parents=True, exist_ok=True)
-            bag_records = records_by_bag_id.get(bag_id, [])
+            run_records = records_by_run_id.get(run_item.run_id, [])
             copied_artifacts = 0
-            for record_index, record in enumerate(bag_records, start=1):
+            for record_index, record in enumerate(run_records, start=1):
                 record_tag = self._sanitize_filename_component(
                     record.finished_at.replace(" ", "_").replace(":", "-")
                 )
                 record_dir = entry_dir / f"{record_index:02d}_{record_tag}"
                 copied_artifacts += self._export_analysis_record_bundle(record, record_dir)
 
-            latest_record = bag_records[-1] if bag_records else None
-            status = self.batch_result_by_bag_id.get(bag_id, "not run")
+            latest_record = run_records[-1] if run_records else None
+            status = self.batch_result_by_run_id.get(run_item.run_id, "not run")
             entry_summary = {
                 "order": order,
+                "run_id": run_item.run_id,
                 "alias": alias,
                 "entry_group": entry.group if entry is not None else "",
-                "bag_id": bag_id,
+                "bag_id": run_item.bag_id,
                 "bag_path": entry.bag_path if entry is not None else "",
                 "play_rate": entry.play_rate if entry is not None else "",
+                "repeat_index": run_item.repeat_index,
+                "repeat_total": run_item.repeat_total,
                 "status": status,
-                "analysis_count": len(bag_records),
+                "analysis_count": len(run_records),
                 "copied_artifacts": copied_artifacts,
             }
             if latest_record is not None:
@@ -3693,11 +3852,14 @@ class BagRunnerWindow(QtWidgets.QWidget):
 
         csv_fields = [
             "order",
+            "run_id",
             "alias",
             "entry_group",
             "bag_id",
             "bag_path",
             "play_rate",
+            "repeat_index",
+            "repeat_total",
             "status",
             "analysis_count",
             "copied_artifacts",
@@ -3967,6 +4129,11 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self.playback_paused = False
         self.pause_started_wall = 0.0
         self.total_paused_wall = 0.0
+        self.current_bag_topics = []
+        self.current_play_topics = []
+        self.play_wait_elapsed_ms = 0
+        self.play_start_not_before_wall = 0.0
+        self.awaiting_auto_unpause = False
         self.flag_event_times = []
         self.current_pause_service = ""
         self.current_analysis_index = -1
@@ -3977,9 +4144,11 @@ class BagRunnerWindow(QtWidgets.QWidget):
             with rosbag.Bag(entry.bag_path, "r") as bag:
                 self.current_bag_start_time = bag.get_start_time()
                 self.current_bag_end_time = bag.get_end_time()
+                self.current_bag_topics = sorted(bag.get_type_and_topic_info().topics.keys())
         except Exception:
             self.current_bag_start_time = 0.0
             self.current_bag_end_time = 0.0
+            self.current_bag_topics = []
         self.status_eta_timer.start()
         self._update_buttons()
         if external_profile is None and self.settings.build_before_run:
@@ -4030,9 +4199,7 @@ class BagRunnerWindow(QtWidgets.QWidget):
 
     def _lio_node_ready(self) -> bool:
         setup = shlex.quote(self._current_session_setup_script())
-        node_pattern = r"^/(lio|lio_node)$"
-        if self.current_external_lio_profile is not None:
-            node_pattern = self.current_external_lio_profile.ready_node_pattern
+        node_pattern = self._current_ready_node_pattern()
         cmd = f"source {setup} >/dev/null 2>&1 && rosnode list 2>/dev/null | grep -Eq {shlex.quote(node_pattern)}"
         try:
             result = subprocess.run(
@@ -4105,7 +4272,117 @@ class BagRunnerWindow(QtWidgets.QWidget):
         if self.node_wait_timer.isActive():
             self.node_wait_timer.stop()
         self._append_lio_log("[info] lio node is ready")
-        self._start_bag_play()
+        self.play_wait_elapsed_ms = 0
+        self.play_start_not_before_wall = time.time() + PLAY_START_MIN_DELAY_MS / 1000.0
+        QtCore.QTimer.singleShot(0, self._wait_lio_subscriptions_then_start_bag)
+
+    def _matching_lio_nodes(self) -> List[str]:
+        setup = shlex.quote(self._current_session_setup_script())
+        node_pattern = self._current_ready_node_pattern()
+        cmd = f"source {setup} >/dev/null 2>&1 && rosnode list 2>/dev/null"
+        try:
+            result = subprocess.run(
+                ["/bin/bash", "-lc", cmd],
+                cwd=str(WORKSPACE_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2.0,
+                text=True,
+            )
+        except subprocess.TimeoutExpired:
+            return []
+        if result.returncode != 0:
+            return []
+        try:
+            pattern = re.compile(node_pattern)
+        except re.error:
+            pattern = re.compile(r"^/(lio|lio_node)$")
+        return [line.strip() for line in result.stdout.splitlines() if pattern.search(line.strip())]
+
+    def _node_subscriptions(self, node_name: str) -> List[str]:
+        setup = shlex.quote(self._current_session_setup_script())
+        cmd = f"source {setup} >/dev/null 2>&1 && rosnode info {shlex.quote(node_name)} 2>/dev/null"
+        try:
+            result = subprocess.run(
+                ["/bin/bash", "-lc", cmd],
+                cwd=str(WORKSPACE_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2.0,
+                text=True,
+            )
+        except subprocess.TimeoutExpired:
+            return []
+        if result.returncode != 0:
+            return []
+        subscriptions: List[str] = []
+        in_section = False
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if line.startswith("Subscriptions:"):
+                in_section = True
+                continue
+            if in_section and (
+                line.startswith("Publications:")
+                or line.startswith("Services:")
+                or line.startswith("Pid:")
+                or line.startswith("Connections:")
+            ):
+                break
+            if not in_section or not line.startswith("* "):
+                continue
+            topic = line[2:].split(" [", 1)[0].strip()
+            if topic:
+                subscriptions.append(topic)
+        return subscriptions
+
+    def _resolve_deterministic_play_topics(self) -> Tuple[bool, List[str], str]:
+        bag_topics = {topic for topic in self.current_bag_topics if topic not in IGNORED_BAG_PLAY_TOPICS}
+        if not bag_topics:
+            return False, [], "bag topic list is empty"
+        nodes = self._matching_lio_nodes()
+        if not nodes:
+            return False, [], "no matching LIO node"
+        subscriptions = set()
+        for node_name in nodes:
+            subscriptions.update(self._node_subscriptions(node_name))
+        play_topics = sorted(topic for topic in bag_topics if topic in subscriptions)
+        if not play_topics:
+            return False, [], f"no subscribed bag topics; nodes={', '.join(nodes)}"
+        return True, play_topics, f"nodes={', '.join(nodes)}"
+
+    def _wait_lio_subscriptions_then_start_bag(self) -> None:
+        if not self.session_running or self.pending_entry is None or self.play_proc.is_running():
+            return
+        ready, play_topics, detail = self._resolve_deterministic_play_topics()
+        enough_delay = time.time() >= self.play_start_not_before_wall
+        if ready and enough_delay:
+            self.current_play_topics = play_topics
+            self._append_rosbag_log(
+                "[deterministic] playing subscribed bag topics: " + ", ".join(self.current_play_topics)
+            )
+            self._append_lio_log(f"[deterministic] LIO subscriptions ready ({detail})")
+            self._start_bag_play()
+            return
+
+        waited_s = self.play_wait_elapsed_ms / 1000.0
+        self._set_status(
+            self._status_with_batch_progress(
+                f"Waiting for deterministic bag start ({waited_s:.0f}s/{PLAY_SUBSCRIPTION_WAIT_TIMEOUT_MS / 1000:.0f}s)"
+            )
+        )
+        if self.play_wait_elapsed_ms >= PLAY_SUBSCRIPTION_WAIT_TIMEOUT_MS:
+            self.current_play_topics = []
+            self._append_rosbag_log(
+                "[warn] deterministic topic wait timed out; falling back to all bag topics without subscriber gating "
+                f"({detail})"
+            )
+            self._start_bag_play()
+            return
+        self.play_wait_elapsed_ms += 500
+        QtCore.QTimer.singleShot(500, self._wait_lio_subscriptions_then_start_bag)
 
     def _start_rviz(self) -> None:
         setup = shlex.quote(self.settings.setup_script)
@@ -4196,15 +4473,45 @@ class BagRunnerWindow(QtWidgets.QWidget):
         if self.pending_entry is None:
             return
         setup = shlex.quote(self._current_session_setup_script())
-        bag_path = shlex.quote(self.pending_entry.bag_path)
         rate = self.pending_entry.play_rate
-        cmd = f"source {setup}; exec rosbag play -r {rate} {bag_path}"
-        self._set_status(self._status_with_batch_progress(f"Playing bag at {rate:.2f}x"))
+        play_args = [
+            "rosbag",
+            "play",
+            "--pause",
+            f"--queue={BAG_PLAY_QUEUE_SIZE}",
+            f"--delay={BAG_PLAY_ADVERTISE_DELAY_SEC:g}",
+            "-r",
+            f"{rate:g}",
+        ]
+        if self.current_play_topics:
+            play_args.append("--wait-for-subscribers")
+        play_args.append(self.pending_entry.bag_path)
+        if self.current_play_topics:
+            play_args.append("--topics")
+            play_args.extend(self.current_play_topics)
+        cmd = f"source {setup}; exec {self._quote_shell_args(play_args)}"
+        self._set_status(self._status_with_batch_progress(f"Preparing deterministic playback at {rate:.2f}x"))
+        self.playback_started_wall = 0.0
+        self.playback_paused = True
+        self.pause_started_wall = 0.0
+        self.total_paused_wall = 0.0
+        self.awaiting_auto_unpause = True
+        self.play_proc.start(cmd, WORKSPACE_ROOT)
+        QtCore.QTimer.singleShot(PLAY_AUTO_UNPAUSE_DELAY_MS, self._auto_unpause_bag_play)
+
+    def _auto_unpause_bag_play(self) -> None:
+        if not self.awaiting_auto_unpause or not self.play_proc.is_running():
+            return
+        self.awaiting_auto_unpause = False
+        self.play_proc.write_stdin(b" ")
         self.playback_started_wall = time.time()
         self.playback_paused = False
         self.pause_started_wall = 0.0
         self.total_paused_wall = 0.0
-        self.play_proc.start(cmd, WORKSPACE_ROOT)
+        if self.pending_entry is not None:
+            self._set_status(self._status_with_batch_progress(f"Playing bag at {self.pending_entry.play_rate:.2f}x"))
+        self._append_rosbag_log("[deterministic] playback unpaused after subscriber-gated warmup")
+        self._update_buttons()
 
     def _toggle_pause_playback(self) -> None:
         if not self.play_proc.is_running():
@@ -4215,10 +4522,14 @@ class BagRunnerWindow(QtWidgets.QWidget):
         now = time.time()
         if requested_pause:
             self.playback_paused = True
+            self.awaiting_auto_unpause = False
             self.pause_started_wall = now
             self._set_status("Playback paused")
             self._append_rosbag_log("[control] playback paused")
         else:
+            if self.awaiting_auto_unpause or self.playback_started_wall <= 0.0:
+                self.playback_started_wall = now
+                self.awaiting_auto_unpause = False
             if self.pause_started_wall > 0.0:
                 self.total_paused_wall += max(0.0, now - self.pause_started_wall)
             self.pause_started_wall = 0.0
@@ -4282,11 +4593,17 @@ class BagRunnerWindow(QtWidgets.QWidget):
         if self.stopping_session or not self._any_managed_process_running():
             return
         if self.batch_mode_active:
-            if self.pending_entry is not None and self.pending_entry.bag_id not in self.batch_result_by_bag_id:
+            current_run_id = self.current_batch_run_item.run_id if self.current_batch_run_item is not None else ""
+            if (
+                self.pending_entry is not None
+                and current_run_id
+                and current_run_id not in self.batch_result_by_run_id
+            ):
                 self._complete_batch_entry(self.pending_entry, "cancelled")
             self.batch_cancelled = True
-            self.batch_queue_ids = []
+            self.batch_queue_items = []
         self.node_wait_timer.stop()
+        self.awaiting_auto_unpause = False
         self.stopping_session = True
         self.stop_deadline_wall = time.time() + 8.0
         for proc in [self.build_proc, self.play_proc, self.rviz_proc, self.lio_proc]:
@@ -4381,10 +4698,11 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self.current_external_lio_profile = None
         self.current_session_records_analysis = True
         self.waiting_for_lio_analysis = False
+        self.current_batch_run_item = None
         self._set_status(status)
         self._update_buttons()
         if self.batch_mode_active and self.flag_generation_thread is None and not self.close_requested:
-            if self.batch_cancelled or not self.batch_queue_ids:
+            if self.batch_cancelled or not self.batch_queue_items:
                 QtCore.QTimer.singleShot(0, self._finish_batch_mode)
             else:
                 QtCore.QTimer.singleShot(0, self._start_next_batch_entry)
@@ -4471,7 +4789,7 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self._refresh_analysis_table()
         self._set_status("Flagged bag generated")
         if self.batch_mode_active and not self.close_requested:
-            if self.batch_cancelled or not self.batch_queue_ids:
+            if self.batch_cancelled or not self.batch_queue_items:
                 QtCore.QTimer.singleShot(0, self._finish_batch_mode)
             else:
                 QtCore.QTimer.singleShot(0, self._start_next_batch_entry)
@@ -4496,7 +4814,7 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self._set_status("Generate failed")
         QtWidgets.QMessageBox.warning(self, "Generate Failed", f"Failed to create with_flag bag:\n{error_text}")
         if self.batch_mode_active and not self.close_requested:
-            if self.batch_cancelled or not self.batch_queue_ids:
+            if self.batch_cancelled or not self.batch_queue_items:
                 QtCore.QTimer.singleShot(0, self._finish_batch_mode)
             else:
                 QtCore.QTimer.singleShot(0, self._start_next_batch_entry)
@@ -4695,7 +5013,8 @@ class BagRunnerWindow(QtWidgets.QWidget):
         self._archive_run_artifacts(record, run_dir)
         self.analysis_records.insert(0, record)
         if self.batch_mode_active:
-            self.batch_new_record_keys.append((record.bag_id, record.finished_at))
+            run_id = self.current_batch_run_item.run_id if self.current_batch_run_item is not None else ""
+            self.batch_new_record_keys.append((run_id, record.bag_id, record.finished_at))
         self._rebuild_yaml_groups_for_bag(record.bag_id)
         self.current_analysis_index = 0
         self._save_state()
