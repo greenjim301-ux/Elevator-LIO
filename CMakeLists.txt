@@ -59,7 +59,7 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 set(YAML_CPP_INCLUDE_DIR /usr/include/yaml-cpp)
 set(YAML_CPP_LIBRARY /usr/lib/x86_64-linux-gnu/libyaml-cpp.so)
 find_package(Eigen3 REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common io)
+find_package(PCL REQUIRED COMPONENTS common io filters kdtree search)
 find_package(Qt5 REQUIRED COMPONENTS Widgets)
 
 add_message_files(
