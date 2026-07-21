@@ -119,6 +119,12 @@ Elevator-LIO 的设计遵循开箱即用的原则，集成了许多便于使用�
 OpenCV 目前只用于协方差矩阵和电梯状态曲线的调试窗口，默认配置中这些窗口均关闭；但源码和 CMake
 仍会包含并链接 OpenCV，您可以自行修改代码取消这些依赖。
 
+仿真节点需要`json`依赖支持
+
+```bash
+sudo apt install -y nlohmann-json3-dev
+```
+
 ### 编译
 
 将代码放入 `src` 目录下编译：
